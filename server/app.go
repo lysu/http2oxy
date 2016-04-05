@@ -5,9 +5,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"sync"
 	"time"
-	"fmt"
 )
 
 func main() {
@@ -16,12 +16,9 @@ func main() {
 	srv.Addr = "localhost:4430"
 	srv.ConnState = idleTimeoutHook()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/info", reqInfoHandler)
+	proxy := NewReverseProxy()
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		mux.ServeHTTP(w, r)
-	})
+	http.Handle("/", proxy)
 
 	http2.ConfigureServer(&srv, &http2.Server{})
 
@@ -31,22 +28,18 @@ func main() {
 
 	select {}
 
-
 }
 
-func reqInfoHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "Method: %s\n", r.Method)
-	fmt.Fprintf(w, "Protocol: %s\n", r.Proto)
-	fmt.Fprintf(w, "Host: %s\n", r.Host)
-	fmt.Fprintf(w, "RemoteAddr: %s\n", r.RemoteAddr)
-	fmt.Fprintf(w, "RequestURI: %q\n", r.RequestURI)
-	fmt.Fprintf(w, "URL: %#v\n", r.URL)
-	fmt.Fprintf(w, "Body.ContentLength: %d (-1 means unknown)\n", r.ContentLength)
-	fmt.Fprintf(w, "Close: %v (relevant for HTTP/1 only)\n", r.Close)
-	fmt.Fprintf(w, "TLS: %#v\n", r.TLS)
-	fmt.Fprintf(w, "\nHeaders:\n")
-	r.Header.Write(w)
+func NewReverseProxy() *httputil.ReverseProxy {
+	director := func(req *http.Request) {
+		req.URL.Scheme = req.URL.Scheme
+		req.URL.Host = req.URL.Host
+		req.URL.Path = req.URL.Path
+		if req.URL.RawQuery != "" {
+			req.URL.RawPath = req.URL.RawQuery
+		}
+	}
+	return &httputil.ReverseProxy{Director: director}
 }
 
 const idleTimeout = 5 * time.Minute
