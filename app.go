@@ -1,38 +1,31 @@
 package main
 
 import (
-	"golang.org/x/net/http2"
-	"log"
-	"net"
-	"net/http"
 	"net/http/httputil"
-	"sync"
-	"time"
 	"io"
 	"io/ioutil"
+	"fmt"
+	"net/http"
+	"log"
 )
 
 func main() {
 
-	var srv http.Server
-	srv.Addr = "0.0.0.0:4430"
-	srv.ConnState = idleTimeoutHook()
 
 	httpProxy := NewReverseProxy()
 
-	http.HandleFunc("/", func(rw http.ResponseWriter, req *http.Request) {
-		isHTTPS := req.TLS != nil
-		if isHTTPS {
-			ServerHTTPS(rw, req)
+	handler := func(rw http.ResponseWriter, req *http.Request) {
+		if req.Method == "Connect" {
+			fmt.Println("Handle https")
 		} else {
+			fmt.Println("Handle as http")
 			httpProxy.ServeHTTP(rw, req)
 		}
-	})
+	}
 
-	http2.ConfigureServer(&srv, &http2.Server{})
 
 	go func() {
-		log.Fatal(srv.ListenAndServeTLS("cc.crt", "cc.key"))
+		log.Fatal(http.ListenAndServeTLS("0.0.0.0:443", "cc.crt", "cc.key", http.HandlerFunc(handler)))
 	}()
 
 	select {}
@@ -77,33 +70,4 @@ func NewReverseProxy() *httputil.ReverseProxy {
 		}
 	}
 	return &httputil.ReverseProxy{Director: director}
-}
-
-const idleTimeout = 5 * time.Minute
-const activeTimeout = 10 * time.Minute
-
-func idleTimeoutHook() func(net.Conn, http.ConnState) {
-	var mu sync.Mutex
-	m := map[net.Conn]*time.Timer{}
-	return func(c net.Conn, cs http.ConnState) {
-		mu.Lock()
-		defer mu.Unlock()
-		if t, ok := m[c]; ok {
-			delete(m, c)
-			t.Stop()
-		}
-		var d time.Duration
-		switch cs {
-		case http.StateNew, http.StateIdle:
-			d = idleTimeout
-		case http.StateActive:
-			d = activeTimeout
-		default:
-			return
-		}
-		m[c] = time.AfterFunc(d, func() {
-			log.Printf("closing idle conn %v after %v", c.RemoteAddr(), d)
-			go c.Close()
-		})
-	}
 }
