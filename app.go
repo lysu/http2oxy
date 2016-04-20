@@ -1,136 +1,129 @@
+// +build go1.6
+
 package main
 
 import (
-	"fmt"
+	"flag"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"os"
 	"time"
 )
 
-func main() {
+const SoTimeout = 30 * time.Second
 
-	httpProxy := NewReverseProxy()
+var (
+	certFile, keyFile *string
+	httpReverseProxy  *httputil.ReverseProxy
+)
 
-	handler := func(rw http.ResponseWriter, req *http.Request) {
-		fmt.Println("----------", req.Method)
-		if req.Method == "CONNECT" {
-			fmt.Println("Handle https")
-			ServerHTTPS(rw, req)
-		} else {
-			fmt.Println("Handle as http")
-			httpProxy.ServeHTTP(rw, req)
-		}
+func init() {
+
+	log.SetOutput(os.Stdout)
+
+	certFile = flag.String("cert", "", "https cert file")
+	keyFile = flag.String("key", "", "https key file")
+	flag.Parse()
+
+	if *certFile == "" || *keyFile == "" {
+		log.Fatalln("Https Cert and Key files are required.")
 	}
 
+	httpReverseProxy = &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = "http"
+			req.URL.Host = req.Host
+			req.URL.Path = req.URL.Path
+			if req.URL.RawQuery != "" {
+				req.URL.RawPath = req.URL.RawQuery
+			}
+		},
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			Dial: (&net.Dialer{
+				Timeout:   SoTimeout,
+				KeepAlive: 30 * time.Second,
+			}).Dial,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		},
+	}
+}
+
+func main() {
+	var s http.Server
+	s.Addr = "0.0.0.0:443"
+	s.Handler = http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if req.Method == "CONNECT" {
+
+			if h1Hijack, ok := rw.(http.Hijacker); ok {
+				clientConn, _, err := h1Hijack.Hijack()
+				if err != nil {
+					log.Fatalln("Error getting client conn:", err)
+					return
+				}
+				handleHTTPS1x(clientConn, req.Host)
+				return
+			}
+
+			handleHTTP2(rw, req)
+			return
+		}
+
+		log.Println("Handle http", req.Host)
+		httpReverseProxy.ServeHTTP(rw, req)
+		return
+	})
+
 	go func() {
-		log.Fatal(http.ListenAndServeTLS("0.0.0.0:443", "cc.crt", "cc.key", http.HandlerFunc(handler)))
+		log.Fatal(s.ListenAndServeTLS(*certFile, *keyFile))
 	}()
 
 	select {}
-
 }
 
-func ServerHTTPS(rw http.ResponseWriter, req *http.Request) {
-	req.Header.Set("Connection", "close")
-	remoteConn, err := net.Dial("tcp", req.Host)
+func handleHTTPS1x(clientConn net.Conn, host string) {
+	remoteConn, err := net.Dial("tcp", host)
 	if err != nil {
-		panic(err)
+		log.Fatalln("H1 Connect to", host, "failured.")
 	}
-	fmt.Printf("Connected %s\n", req.Host)
-
-	go Pipe(remoteConn, &clientConn{
-		Reader: req.Body,
-		Writer: rw,
-	})
-	rw.WriteHeader(http.StatusOK)
-	fmt.Println(remoteConn)
-
-	//a, err := ioutil.ReadAll(req.Body)
-	//if err != nil {
-	//	panic(err)
-	//}
-	//
-	//log.Printf("----===%s\n", string(a))
-}
-
-type x interface {
-	Write(b []byte) (n int, err error)
-	Read(b []byte) (n int, err error)
-	SetDeadline(t time.Time) error
-}
-
-type clientConn struct {
-	io.Reader
-	io.Writer
-}
-
-func (c *clientConn) SetDeadline(t time.Time) error {
-	return nil
-}
-
-func Pipe(conn1 x, conn2 x) {
-	chan1 := makeConnChan(conn1, 1)
-	chan2 := makeConnChan(conn2, 2)
-
-	for {
-		select {
-		case b1 := <-chan1:
-			if b1 == nil {
-				return
-			} else {
-				conn2.Write(b1)
-			}
-		case b2 := <-chan2:
-			if b2 == nil {
-				return
-			} else {
-				conn1.Write(b2)
-			}
-		}
-	}
-}
-
-func makeConnChan(conn x, num int) chan []byte {
-	c := make(chan []byte)
-
+	clientConn.Write([]byte("HTTP/1.0 200 Connection established\r\n\r\n"))
 	go func() {
-		b := make([]byte, 1024)
-
-		for {
-			conn.SetDeadline(time.Now().Add(100 * time.Millisecond))
-			n, err := conn.Read(b)
-
-			if n > 0 {
-				res := make([]byte, n)
-				copy(res, b[:n])
-				c <- res
-			}
-
-			if err != nil {
-				c <- nil
-				if err != io.EOF {
-					log.Printf("%d Piping error %s", num, err)
-				} else {
-					log.Printf("reading finished")
-				}
-			}
+		_, err := io.Copy(timeoutWriter{remoteConn, SoTimeout}, timeoutReader{clientConn, SoTimeout})
+		if err != nil {
+			log.Fatalln("H1 Handle Read", host, "Failure with", err.Error())
 		}
 	}()
 
-	return c
+	_, err = io.Copy(timeoutWriter{clientConn, SoTimeout}, timeoutReader{remoteConn, SoTimeout})
+	if err != nil {
+		log.Fatalln("H1 Handle Write", host, "Failure with", err.Error())
+	}
 }
 
-func NewReverseProxy() *httputil.ReverseProxy {
-	director := func(req *http.Request) {
-		req.URL.Scheme = "https"
-		req.URL.Host = req.Host
-		req.URL.Path = req.URL.Path
-		if req.URL.RawQuery != "" {
-			req.URL.RawPath = req.URL.RawQuery
-		}
+func handleHTTP2(rw http.ResponseWriter, req *http.Request) {
+	remoteConn, err := net.Dial("tcp", req.Host)
+	if err != nil {
+		log.Fatalln("H2 Connect to", req.Host, "failured.")
 	}
-	return &httputil.ReverseProxy{Director: director}
+	log.Println("H2 Connect to", req.Host)
+
+	rw.WriteHeader(200)
+	f, _ := rw.(http.Flusher)
+	f.Flush()
+
+	go func() {
+		_, err := io.Copy(timeoutWriter{remoteConn, SoTimeout}, timeoutReader{req.Body, SoTimeout})
+		if err != nil {
+			log.Fatalln("H2 Handle Read", req.Host, "Failure with", err.Error())
+		}
+	}()
+
+	_, err = io.Copy(timeoutWriter{flushWriter{rw}, SoTimeout}, timeoutReader{remoteConn, SoTimeout})
+	if err != nil {
+		log.Fatalln("H2 Handle Write", req.Host, "Failure with", err.Error())
+	}
 }
